@@ -1,0 +1,158 @@
+openapi: 3.0.0
+info:
+  title: ramen-api-server
+  description: ラーメンマップアプリ用 API サーバー（YouTube / Google Places キャッシュプロキシ）
+  version: 1.0.0
+
+servers:
+  - url: https://ramen-api-server-dda6frdjhpehcubw.japanwest-01.azurewebsites.net
+    description: Azure (Production)
+  - url: http://localhost:3000
+    description: ローカル開発
+
+tags:
+  - name: General
+    description: サーバー状態確認
+  - name: YouTube
+    description: YouTube Data API キャッシュプロキシ
+  - name: Cache
+    description: キャッシュ管理
+
+paths:
+  /:
+    get:
+      tags: [General]
+      summary: ヘルスチェック
+      responses:
+        '200':
+          description: サーバー正常動作中
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  message:
+                    type: string
+                    example: ramen-api-server is running
+                  cache:
+                    type: string
+                    example: 3 entries
+
+  /youtube/search:
+    get:
+      tags: [YouTube]
+      summary: YouTube 動画検索（7日キャッシュ）
+      description: |
+        YouTube Data API の search.list をプロキシする。
+        APIキーはサーバー側で管理するためクライアントからの指定不要。
+        同一クエリは7日間キャッシュされ API クォータを節約する。
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: 検索キーワード（例：SUSURU TV. 一蘭）
+          schema:
+            type: string
+        - name: type
+          in: query
+          description: 検索タイプ
+          schema:
+            type: string
+            default: video
+        - name: maxResults
+          in: query
+          description: 最大取得件数
+          schema:
+            type: integer
+            default: 5
+        - name: order
+          in: query
+          description: 並び順
+          schema:
+            type: string
+            enum: [relevance, date, viewCount, rating]
+            default: relevance
+        - name: part
+          in: query
+          description: レスポンスに含めるパーツ
+          schema:
+            type: string
+            default: snippet
+      responses:
+        '200':
+          description: YouTube search.list レスポンス
+          headers:
+            X-Cache:
+              description: HIT=キャッシュ返却 / MISS=API呼び出し
+              schema:
+                type: string
+                enum: [HIT, MISS]
+        '400':
+          description: q パラメータが未指定
+        '503':
+          description: サーバーの YOUTUBE_API_KEY が未設定
+
+  /youtube/videos:
+    get:
+      tags: [YouTube]
+      summary: YouTube 動画詳細取得（30日キャッシュ）
+      description: |
+        YouTube Data API の videos.list をプロキシする。
+        同一 ID リストは30日間キャッシュされる。
+      parameters:
+        - name: id
+          in: query
+          required: true
+          description: 動画IDのカンマ区切りリスト
+          schema:
+            type: string
+            example: ABC123,DEF456
+        - name: part
+          in: query
+          description: レスポンスに含めるパーツ
+          schema:
+            type: string
+            default: snippet,contentDetails
+      responses:
+        '200':
+          description: YouTube videos.list レスポンス
+          headers:
+            X-Cache:
+              description: HIT=キャッシュ返却 / MISS=API呼び出し
+              schema:
+                type: string
+                enum: [HIT, MISS]
+        '400':
+          description: id パラメータが未指定
+        '503':
+          description: サーバーの YOUTUBE_API_KEY が未設定
+
+  /cache/stats:
+    get:
+      tags: [Cache]
+      summary: キャッシュ状況確認
+      description: 現在メモリに保持しているキャッシュの一覧と残り有効期限を返す。
+      responses:
+        '200':
+          description: キャッシュ統計
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                    example: 3
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key:
+                          type: string
+                        expiresIn:
+                          type: string
+                          example: 604799s

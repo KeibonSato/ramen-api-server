@@ -1,10 +1,18 @@
 'use strict';
 
-const express = require('express');
-const https   = require('https');
+const express    = require('express');
+const https      = require('https');
+const swaggerUi  = require('swagger-ui-express');
+const YAML       = require('yamljs');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+
+// Swagger UI
+const swaggerDocument = YAML.load('./swagger.yaml');
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 // ─────────────────────────────────────────
 //  インメモリキャッシュ
