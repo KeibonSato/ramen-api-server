@@ -18,8 +18,11 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 //  インメモリキャッシュ
 // ─────────────────────────────────────────
 const CACHE_TTL_MS = {
-  search : 7  * 24 * 60 * 60 * 1000,  //  7日
-  videos : 30 * 24 * 60 * 60 * 1000,  // 30日
+  search             : 7  * 24 * 60 * 60 * 1000,  //  7日
+  videos             : 30 * 24 * 60 * 60 * 1000,  // 30日
+  placesNearby       : 24 * 60 * 60 * 1000,        // 24時間
+  placesDetails      : 7  * 24 * 60 * 60 * 1000,  //  7日
+  placesAutocomplete : 24 * 60 * 60 * 1000,        // 24時間
 };
 
 /** @type {Map<string, {data: any, expiresAt: number}>} */
@@ -37,6 +40,28 @@ function cacheGet(key) {
 
 function cacheSet(key, data, ttlMs) {
   cache.set(key, { data, expiresAt: Date.now() + ttlMs });
+}
+
+// ─────────────────────────────────────────
+//  Google Places API ヘルパー
+// ─────────────────────────────────────────
+const PLACES_BASE = 'https://maps.googleapis.com/maps/api/place';
+
+function placesFetch(path) {
+  return new Promise((resolve, reject) => {
+    const url = PLACES_BASE + path + '&key=' + encodeURIComponent(process.env.GOOGLE_PLACES_API_KEY || '');
+    https.get(url, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => {
+        try {
+          resolve({ status: res.statusCode, body: JSON.parse(raw) });
+        } catch (e) {
+          resolve({ status: res.statusCode, body: {} });
+        }
+      });
+    }).on('error', reject);
+  });
 }
 
 // ─────────────────────────────────────────
@@ -158,6 +183,121 @@ app.get('/youtube/videos', async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
+});
+
+// ─────────────────────────────────────────
+//  Places API ルート
+// ─────────────────────────────────────────
+
+/**
+ * 周辺ラーメン店検索（24時間キャッシュ）
+ * GET /places/nearbysearch?location=35.7,139.7&radius=1500&keyword=ラーメン&language=ja
+ */
+app.get('/places/nearbysearch', async (req, res) => {
+  const params = { ...req.query };
+  delete params.key;
+
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
+
+  let cacheKey = null;
+  if (!params.pagetoken && params.location) {
+    // lat/lng をタイル単位（約890m）でグループ化してキャッシュ
+    const [lat, lng] = params.location.split(',').map(Number);
+    const latTile = Math.floor(lat / 0.008);
+    const lngTile = Math.floor(lng / 0.008);
+    cacheKey = `places:nearby:${latTile}_${lngTile}:${params.radius || '1500'}`;
+  }
+  // pagetoken は使い捨てなのでキャッシュしない
+
+  if (cacheKey) {
+    const cached = cacheGet(cacheKey);
+    if (cached) return res.set('X-Cache', 'HIT').json(cached);
+  }
+
+  const qs = new URLSearchParams(params).toString();
+  try {
+    const { status, body } = await placesFetch(`/nearbysearch/json?${qs}`);
+    if (cacheKey && status === 200 && (body.status === 'OK' || body.status === 'ZERO_RESULTS')) {
+      cacheSet(cacheKey, body, CACHE_TTL_MS.placesNearby);
+    }
+    return res.status(status).set('X-Cache', cacheKey ? 'MISS' : 'SKIP').json(body);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * 店舗詳細取得（7日キャッシュ）
+ * GET /places/details?place_id=XXX&fields=place_id,name,...&language=ja
+ */
+app.get('/places/details', async (req, res) => {
+  const params = { ...req.query };
+  delete params.key;
+
+  if (!params.place_id) return res.status(400).json({ error: 'place_id is required' });
+
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
+
+  const cacheKey = `places:details:${params.place_id}:${params.fields || 'all'}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return res.set('X-Cache', 'HIT').json(cached);
+
+  const qs = new URLSearchParams(params).toString();
+  try {
+    const { status, body } = await placesFetch(`/details/json?${qs}`);
+    if (status === 200 && body.status === 'OK') {
+      cacheSet(cacheKey, body, CACHE_TTL_MS.placesDetails);
+    }
+    return res.status(status).set('X-Cache', 'MISS').json(body);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * 店舗名オートコンプリート（24時間キャッシュ）
+ * GET /places/autocomplete?input=一蘭&language=ja
+ */
+app.get('/places/autocomplete', async (req, res) => {
+  const params = { ...req.query };
+  delete params.key;
+
+  if (!params.input) return res.status(400).json({ error: 'input is required' });
+
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
+
+  const cacheKey = `places:autocomplete:${params.input}:${params.language || 'ja'}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return res.set('X-Cache', 'HIT').json(cached);
+
+  const qs = new URLSearchParams(params).toString();
+  try {
+    const { status, body } = await placesFetch(`/autocomplete/json?${qs}`);
+    if (status === 200 && (body.status === 'OK' || body.status === 'ZERO_RESULTS')) {
+      cacheSet(cacheKey, body, CACHE_TTL_MS.placesAutocomplete);
+    }
+    return res.status(status).set('X-Cache', 'MISS').json(body);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * 店舗写真（APIキーを隠してリダイレクト）
+ * GET /places/photo?photo_reference=XXX&maxwidth=400
+ */
+app.get('/places/photo', (req, res) => {
+  const { photo_reference, maxwidth } = req.query;
+  if (!photo_reference) return res.status(400).json({ error: 'photo_reference is required' });
+
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
+
+  const redirectUrl = `${PLACES_BASE}/photo?photo_reference=${photo_reference}&maxwidth=${maxwidth || 400}&key=${apiKey}`;
+  res.redirect(redirectUrl);
 });
 
 // キャッシュ状況確認（管理用）

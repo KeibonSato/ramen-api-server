@@ -15,6 +15,8 @@ tags:
     description: サーバー状態確認
   - name: YouTube
     description: YouTube Data API キャッシュプロキシ
+  - name: Places
+    description: Google Places API キャッシュプロキシ
   - name: Cache
     description: キャッシュ管理
 
@@ -129,6 +131,112 @@ paths:
           description: id パラメータが未指定
         '503':
           description: サーバーの YOUTUBE_API_KEY が未設定
+
+  /places/nearbysearch:
+    get:
+      tags: [Places]
+      summary: 周辺ラーメン店検索（24時間キャッシュ）
+      description: |
+        Google Places API の nearbysearch をプロキシする。
+        location+radius の組み合わせをタイル単位でキャッシュ（約890m単位）。
+        pagetoken 指定時はキャッシュしない（トークンは使い捨て）。
+      parameters:
+        - name: location
+          in: query
+          description: 緯度,経度（例：35.7,139.7）
+          schema:
+            type: string
+        - name: radius
+          in: query
+          description: 検索半径（メートル）
+          schema:
+            type: integer
+            default: 1500
+        - name: keyword
+          in: query
+          schema:
+            type: string
+            default: ラーメン
+        - name: language
+          in: query
+          schema:
+            type: string
+            default: ja
+        - name: pagetoken
+          in: query
+          description: 次ページトークン（指定時はキャッシュしない）
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Places nearbysearch レスポンス
+          headers:
+            X-Cache:
+              schema:
+                type: string
+                enum: [HIT, MISS, SKIP]
+
+  /places/details:
+    get:
+      tags: [Places]
+      summary: 店舗詳細取得（7日キャッシュ）
+      parameters:
+        - name: place_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: fields
+          in: query
+          schema:
+            type: string
+            default: place_id,name,rating,user_ratings_total,formatted_address,photos,opening_hours,geometry
+        - name: language
+          in: query
+          schema:
+            type: string
+            default: ja
+      responses:
+        '200':
+          description: Places details レスポンス
+
+  /places/autocomplete:
+    get:
+      tags: [Places]
+      summary: 店舗名オートコンプリート（24時間キャッシュ）
+      parameters:
+        - name: input
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: language
+          in: query
+          schema:
+            type: string
+            default: ja
+      responses:
+        '200':
+          description: Places autocomplete レスポンス
+
+  /places/photo:
+    get:
+      tags: [Places]
+      summary: 店舗写真（APIキーを隠してリダイレクト）
+      parameters:
+        - name: photo_reference
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: maxwidth
+          in: query
+          schema:
+            type: integer
+            default: 400
+      responses:
+        '302':
+          description: Google の写真URLへリダイレクト
 
   /cache/stats:
     get:
