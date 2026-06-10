@@ -373,10 +373,10 @@ app.get('/tabelog/search', async (req, res) => {
     }
 
     const results = body.organic_results || [];
-    // tabelog.com/[都道府県]/A[エリアコード]/[店舗ID]/ の形式のURLを優先
+    // tabelog.com/[都道府県]/A[エリア]/A[サブエリア]/[店舗ID]/ の形式のURLを優先
     const tabelogUrl = results
       .map(item => item.link)
-      .find(link => /tabelog\.com\/[a-z]+\/A\d+\/\d+\/\d+\//.test(link)) || null;
+      .find(link => /tabelog\.com\/[a-z]+\/A\d+\/A\d+\/\d+\//.test(link)) || null;
 
     const result = { url: tabelogUrl };
     // URLが見つかった場合のみキャッシュ（見つからない場合は再検索の余地を残す）
