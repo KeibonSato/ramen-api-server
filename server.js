@@ -385,6 +385,19 @@ app.get('/tabelog/search', async (req, res) => {
   }
 });
 
+// 食べログ検索デバッグ（確認後に削除すること）
+app.get('/tabelog/debug', async (req, res) => {
+  const apiKey = process.env.GOOGLE_CUSTOM_SEARCH_API_KEY;
+  const cx     = process.env.GOOGLE_CUSTOM_SEARCH_CX;
+  const query  = `site:tabelog.com ${req.query.name || '一蘭'}`;
+  try {
+    const { status, body } = await customSearchFetch(query);
+    res.json({ apiKeySet: !!apiKey, cxSet: !!cx, query, status, body });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // キャッシュ状況確認（管理用）
 app.get('/cache/stats', (_req, res) => {
   const now = Date.now();
