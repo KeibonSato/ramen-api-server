@@ -93,16 +93,22 @@ function ytFetch(path) {
 }
 
 // ─────────────────────────────────────────
-//  Google Custom Search API ヘルパー
+//  SerpAPI ヘルパー
 // ─────────────────────────────────────────
-const CUSTOM_SEARCH_BASE = 'https://www.googleapis.com/customsearch/v1';
+const SERP_API_BASE = 'https://serpapi.com/search.json';
 
-function customSearchFetch(query) {
+function serpApiFetch(query) {
   return new Promise((resolve, reject) => {
-    const apiKey = process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
-    const cx     = process.env.GOOGLE_CUSTOM_SEARCH_CX     || '';
-    const qs     = new URLSearchParams({ key: apiKey, cx, q: query, num: 1 }).toString();
-    const url    = `${CUSTOM_SEARCH_BASE}?${qs}`;
+    const apiKey = process.env.SERP_API_KEY || '';
+    const qs     = new URLSearchParams({
+      api_key : apiKey,
+      engine  : 'google',
+      q       : query,
+      num     : '1',
+      hl      : 'ja',
+      gl      : 'jp',
+    }).toString();
+    const url = `${SERP_API_BASE}?${qs}`;
     https.get(url, (res) => {
       let raw = '';
       res.on('data', chunk => raw += chunk);
@@ -344,10 +350,9 @@ app.get('/tabelog/search', async (req, res) => {
     return res.status(400).json({ error: 'place_id or name is required' });
   }
 
-  const apiKey = process.env.GOOGLE_CUSTOM_SEARCH_API_KEY;
-  const cx     = process.env.GOOGLE_CUSTOM_SEARCH_CX;
-  if (!apiKey || !cx) {
-    return res.status(503).json({ error: 'GOOGLE_CUSTOM_SEARCH_API_KEY or GOOGLE_CUSTOM_SEARCH_CX is not configured on server' });
+  const apiKey = process.env.SERP_API_KEY;
+  if (!apiKey) {
+    return res.status(503).json({ error: 'SERP_API_KEY is not configured on server' });
   }
 
   // place_id をキャッシュキーに使うことで全ユーザー共有・API消費を最小化
@@ -361,15 +366,15 @@ app.get('/tabelog/search', async (req, res) => {
   const query = `site:tabelog.com ${name || ''}${address ? ' ' + address : ''}`.trim();
 
   try {
-    const { status, body } = await customSearchFetch(query);
+    const { status, body } = await serpApiFetch(query);
 
     if (status !== 200 || body.error) {
       return res.status(status).set('X-Cache', 'MISS').json({ url: null });
     }
 
-    const items = body.items || [];
+    const results = body.organic_results || [];
     // tabelog.com/[都道府県]/A[エリアコード]/[店舗ID]/ の形式のURLを優先
-    const tabelogUrl = items
+    const tabelogUrl = results
       .map(item => item.link)
       .find(link => /tabelog\.com\/[a-z]+\/A\d+\/\d+\/\d+\//.test(link)) || null;
 
@@ -387,12 +392,11 @@ app.get('/tabelog/search', async (req, res) => {
 
 // 食べログ検索デバッグ（確認後に削除すること）
 app.get('/tabelog/debug', async (req, res) => {
-  const apiKey = process.env.GOOGLE_CUSTOM_SEARCH_API_KEY;
-  const cx     = process.env.GOOGLE_CUSTOM_SEARCH_CX;
+  const apiKey = process.env.SERP_API_KEY;
   const query  = `site:tabelog.com ${req.query.name || '一蘭'}`;
   try {
-    const { status, body } = await customSearchFetch(query);
-    res.json({ apiKeySet: !!apiKey, cxSet: !!cx, query, status, body });
+    const { status, body } = await serpApiFetch(query);
+    res.json({ apiKeySet: !!apiKey, query, status, body });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
