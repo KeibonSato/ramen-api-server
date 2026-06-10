@@ -23,6 +23,7 @@ const CACHE_TTL_MS = {
   placesNearby       : 24 * 60 * 60 * 1000,        // 24時間
   placesDetails      : 7  * 24 * 60 * 60 * 1000,  //  7日
   placesAutocomplete : 24 * 60 * 60 * 1000,        // 24時間
+  tabelogSearch      : 90 * 24 * 60 * 60 * 1000,  // 90日（食べログURLは変わりにくい）
 };
 
 /** @type {Map<string, {data: any, expiresAt: number}>} */
@@ -77,6 +78,31 @@ const YT_BASE = 'https://www.googleapis.com/youtube/v3';
 function ytFetch(path) {
   return new Promise((resolve, reject) => {
     const url = YT_BASE + path + '&key=' + encodeURIComponent(process.env.YOUTUBE_API_KEY || '');
+    https.get(url, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => {
+        try {
+          resolve({ status: res.statusCode, body: JSON.parse(raw) });
+        } catch (e) {
+          resolve({ status: res.statusCode, body: {} });
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+// ─────────────────────────────────────────
+//  Google Custom Search API ヘルパー
+// ─────────────────────────────────────────
+const CUSTOM_SEARCH_BASE = 'https://www.googleapis.com/customsearch/v1';
+
+function customSearchFetch(query) {
+  return new Promise((resolve, reject) => {
+    const apiKey = process.env.GOOGLE_CUSTOM_SEARCH_API_KEY || '';
+    const cx     = process.env.GOOGLE_CUSTOM_SEARCH_CX     || '';
+    const qs     = new URLSearchParams({ key: apiKey, cx, q: query, num: 1 }).toString();
+    const url    = `${CUSTOM_SEARCH_BASE}?${qs}`;
     https.get(url, (res) => {
       let raw = '';
       res.on('data', chunk => raw += chunk);
@@ -298,6 +324,65 @@ app.get('/places/photo', (req, res) => {
 
   const redirectUrl = `${PLACES_BASE}/photo?photo_reference=${photo_reference}&maxwidth=${maxwidth || 400}&key=${apiKey}`;
   res.redirect(redirectUrl);
+});
+
+// ─────────────────────────────────────────
+//  食べログ検索ルート
+// ─────────────────────────────────────────
+
+/**
+ * 食べログURL検索（90日キャッシュ・全ユーザー共有）
+ *
+ * GET /tabelog/search?place_id=XXX&name=一蘭&address=福岡県福岡市
+ *
+ * レスポンス: { url: "https://tabelog.com/..." } or { url: null }
+ */
+app.get('/tabelog/search', async (req, res) => {
+  const { place_id, name, address } = req.query;
+
+  if (!place_id && !name) {
+    return res.status(400).json({ error: 'place_id or name is required' });
+  }
+
+  const apiKey = process.env.GOOGLE_CUSTOM_SEARCH_API_KEY;
+  const cx     = process.env.GOOGLE_CUSTOM_SEARCH_CX;
+  if (!apiKey || !cx) {
+    return res.status(503).json({ error: 'GOOGLE_CUSTOM_SEARCH_API_KEY or GOOGLE_CUSTOM_SEARCH_CX is not configured on server' });
+  }
+
+  // place_id をキャッシュキーに使うことで全ユーザー共有・API消費を最小化
+  const cacheKey = `tabelog:${place_id || name}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== null) {
+    return res.set('X-Cache', 'HIT').json(cached);
+  }
+
+  // "site:tabelog.com 店名 住所" で検索
+  const query = `site:tabelog.com ${name || ''}${address ? ' ' + address : ''}`.trim();
+
+  try {
+    const { status, body } = await customSearchFetch(query);
+
+    if (status !== 200 || body.error) {
+      return res.status(status).set('X-Cache', 'MISS').json({ url: null });
+    }
+
+    const items = body.items || [];
+    // tabelog.com/[都道府県]/A[エリアコード]/[店舗ID]/ の形式のURLを優先
+    const tabelogUrl = items
+      .map(item => item.link)
+      .find(link => /tabelog\.com\/[a-z]+\/A\d+\/\d+\/\d+\//.test(link)) || null;
+
+    const result = { url: tabelogUrl };
+    // URLが見つかった場合のみキャッシュ（見つからない場合は再検索の余地を残す）
+    if (tabelogUrl) {
+      cacheSet(cacheKey, result, CACHE_TTL_MS.tabelogSearch);
+    }
+
+    return res.set('X-Cache', 'MISS').json(result);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // キャッシュ状況確認（管理用）
