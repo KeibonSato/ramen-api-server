@@ -2,6 +2,8 @@
 
 const express    = require('express');
 const https      = require('https');
+const fs         = require('fs');
+const path       = require('path');
 const swaggerUi  = require('swagger-ui-express');
 const YAML       = require('yamljs');
 
@@ -333,6 +335,50 @@ app.get('/places/photo', (req, res) => {
 });
 
 // ─────────────────────────────────────────
+//  食べログキャッシュ永続化（/home に保存）
+// ─────────────────────────────────────────
+
+// Azure App Service の /home は再起動後も消えない永続ストレージ
+const TABELOG_CACHE_FILE = path.join(process.env.HOME || '/home', 'tabelog_cache.json');
+
+// 起動時にファイルからキャッシュを復元
+function loadTabelogCacheFromFile() {
+  try {
+    if (!fs.existsSync(TABELOG_CACHE_FILE)) return;
+    const raw = fs.readFileSync(TABELOG_CACHE_FILE, 'utf8');
+    const entries = JSON.parse(raw);
+    const now = Date.now();
+    let loaded = 0;
+    for (const [key, entry] of Object.entries(entries)) {
+      if (entry.expiresAt > now) {
+        cache.set(key, entry);
+        loaded++;
+      }
+    }
+    console.log(`tabelog cache restored: ${loaded} entries from file`);
+  } catch (e) {
+    console.error('tabelog cache load error:', e.message);
+  }
+}
+
+// 食べログキャッシュのみファイルに書き出す
+function saveTabelogCacheToFile() {
+  try {
+    const tabelogEntries = {};
+    for (const [key, val] of cache.entries()) {
+      if (key.startsWith('tabelog:')) {
+        tabelogEntries[key] = val;
+      }
+    }
+    fs.writeFileSync(TABELOG_CACHE_FILE, JSON.stringify(tabelogEntries), 'utf8');
+  } catch (e) {
+    console.error('tabelog cache save error:', e.message);
+  }
+}
+
+loadTabelogCacheFromFile();
+
+// ─────────────────────────────────────────
 //  食べログ検索ルート
 // ─────────────────────────────────────────
 
@@ -368,6 +414,11 @@ app.get('/tabelog/search', async (req, res) => {
   try {
     const { status, body } = await serpApiFetch(query);
 
+    // 429: SerpAPI月間クォータ超過 → クライアントにそのまま返してリトライ抑制
+    if (status === 429) {
+      return res.status(429).set('X-Cache', 'MISS').json({ error: 'quota_exceeded' });
+    }
+
     if (status !== 200 || body.error) {
       return res.status(status).set('X-Cache', 'MISS').json({ url: null });
     }
@@ -379,9 +430,10 @@ app.get('/tabelog/search', async (req, res) => {
       .find(link => /tabelog\.com\/[a-z]+\/A\d+\/A\d+\/\d+\//.test(link)) || null;
 
     const result = { url: tabelogUrl };
-    // URLが見つかった場合のみキャッシュ（見つからない場合は再検索の余地を残す）
+    // URLが見つかった場合のみキャッシュしてファイルに永続化
     if (tabelogUrl) {
       cacheSet(cacheKey, result, CACHE_TTL_MS.tabelogSearch);
+      saveTabelogCacheToFile();
     }
 
     return res.set('X-Cache', 'MISS').json(result);
