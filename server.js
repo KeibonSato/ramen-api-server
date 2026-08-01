@@ -22,8 +22,8 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 const CACHE_TTL_MS = {
   search             : 7  * 24 * 60 * 60 * 1000,  //  7日
   videos             : 30 * 24 * 60 * 60 * 1000,  // 30日
-  placesNearby       : 24 * 60 * 60 * 1000,        // 24時間
-  placesDetails      : 7  * 24 * 60 * 60 * 1000,  //  7日
+  placesNearby       : 7  * 24 * 60 * 60 * 1000,  //  7日（24時間→7日に延長）
+  placesDetails      : 30 * 24 * 60 * 60 * 1000,  // 30日（7日→30日に延長）
   placesAutocomplete : 24 * 60 * 60 * 1000,        // 24時間
   tabelogSearch      : 90 * 24 * 60 * 60 * 1000,  // 90日（食べログURLは変わりにくい）
 };
@@ -46,9 +46,39 @@ function cacheSet(key, data, ttlMs) {
 }
 
 // ─────────────────────────────────────────
+//  写真キャッシュ設定
+// ─────────────────────────────────────────
+const PHOTO_CACHE_DIR    = path.join(process.env.HOME || '/home', 'photo_cache');
+const PHOTO_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90日
+
+try { fs.mkdirSync(PHOTO_CACHE_DIR, { recursive: true }); } catch (_) {}
+
+// ─────────────────────────────────────────
 //  Google Places API ヘルパー
 // ─────────────────────────────────────────
 const PLACES_BASE = 'https://maps.googleapis.com/maps/api/place';
+
+// HTTPSリクエストでリダイレクトを1段階追跡してバッファを返す
+function fetchWithRedirect(url, depth = 0) {
+  return new Promise((resolve, reject) => {
+    if (depth > 3) return reject(new Error('too many redirects'));
+    https.get(url, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) {
+        const location = res.headers['location'];
+        if (!location) return reject(new Error('redirect with no location header'));
+        res.resume();
+        return resolve(fetchWithRedirect(location, depth + 1));
+      }
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve({
+        statusCode   : res.statusCode,
+        contentType  : res.headers['content-type'] || 'image/jpeg',
+        data         : Buffer.concat(chunks),
+      }));
+    }).on('error', reject);
+  });
+}
 
 function placesFetch(path) {
   return new Promise((resolve, reject) => {
@@ -283,6 +313,7 @@ app.get('/places/details', async (req, res) => {
     const { status, body } = await placesFetch(`/details/json?${qs}`);
     if (status === 200 && body.status === 'OK') {
       cacheSet(cacheKey, body, CACHE_TTL_MS.placesDetails);
+      saveDetailsCacheToFile();
     }
     return res.status(status).set('X-Cache', 'MISS').json(body);
   } catch (err) {
@@ -320,19 +351,87 @@ app.get('/places/autocomplete', async (req, res) => {
 });
 
 /**
- * 店舗写真（APIキーを隠してリダイレクト）
+ * 店舗写真（ファイルキャッシュ付き・90日TTL）
  * GET /places/photo?photo_reference=XXX&maxwidth=400
+ *
+ * キャッシュHIT: /home/photo_cache/ からファイルを直接返す
+ * キャッシュMISS: Google Places Photo APIから取得しファイル保存後に返す
  */
-app.get('/places/photo', (req, res) => {
+app.get('/places/photo', async (req, res) => {
   const { photo_reference, maxwidth } = req.query;
   if (!photo_reference) return res.status(400).json({ error: 'photo_reference is required' });
 
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
 
-  const redirectUrl = `${PLACES_BASE}/photo?photo_reference=${photo_reference}&maxwidth=${maxwidth || 400}&key=${apiKey}`;
-  res.redirect(redirectUrl);
+  // ファイル名: photo_reference の記号をアンダースコアに変換して安全なパスにする
+  const mw       = String(maxwidth || 400);
+  const safeRef  = photo_reference.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const cacheFile = path.join(PHOTO_CACHE_DIR, `${safeRef}_${mw}`);
+
+  // キャッシュHIT確認（ファイルのmtimeで90日TTLを判定）
+  try {
+    const stat = fs.statSync(cacheFile);
+    if (Date.now() - stat.mtimeMs < PHOTO_CACHE_TTL_MS) {
+      const data = fs.readFileSync(cacheFile);
+      return res.set('X-Cache', 'HIT').set('Content-Type', 'image/jpeg').send(data);
+    }
+  } catch (_) { /* キャッシュなし */ }
+
+  // キャッシュMISS: Googleから取得（リダイレクト追跡）
+  const googleUrl = `${PLACES_BASE}/photo?photo_reference=${encodeURIComponent(photo_reference)}&maxwidth=${mw}&key=${apiKey}`;
+  try {
+    const { statusCode, contentType, data } = await fetchWithRedirect(googleUrl);
+    if (statusCode === 200 && data.length > 0) {
+      try { fs.writeFileSync(cacheFile, data); } catch (_) { /* ディスク書き込み失敗は無視 */ }
+      return res.set('X-Cache', 'MISS').set('Content-Type', contentType).send(data);
+    }
+    return res.status(statusCode).send(data);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
+
+// ─────────────────────────────────────────
+//  Place Details キャッシュ永続化（/home に保存）
+// ─────────────────────────────────────────
+
+const DETAILS_CACHE_FILE = path.join(process.env.HOME || '/home', 'details_cache.json');
+
+function loadDetailsCacheFromFile() {
+  try {
+    if (!fs.existsSync(DETAILS_CACHE_FILE)) return;
+    const raw     = fs.readFileSync(DETAILS_CACHE_FILE, 'utf8');
+    const entries = JSON.parse(raw);
+    const now     = Date.now();
+    let loaded    = 0;
+    for (const [key, entry] of Object.entries(entries)) {
+      if (entry.expiresAt > now) {
+        cache.set(key, entry);
+        loaded++;
+      }
+    }
+    console.log(`details cache restored: ${loaded} entries from file`);
+  } catch (e) {
+    console.error('details cache load error:', e.message);
+  }
+}
+
+function saveDetailsCacheToFile() {
+  try {
+    const detailsEntries = {};
+    for (const [key, val] of cache.entries()) {
+      if (key.startsWith('places:details:')) {
+        detailsEntries[key] = val;
+      }
+    }
+    fs.writeFileSync(DETAILS_CACHE_FILE, JSON.stringify(detailsEntries), 'utf8');
+  } catch (e) {
+    console.error('details cache save error:', e.message);
+  }
+}
+
+loadDetailsCacheFromFile();
 
 // ─────────────────────────────────────────
 //  食べログキャッシュ永続化（/home に保存）
