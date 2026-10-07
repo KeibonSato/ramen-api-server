@@ -6,6 +6,7 @@ const fs         = require('fs');
 const path       = require('path');
 const swaggerUi  = require('swagger-ui-express');
 const YAML       = require('yamljs');
+const { normalizeTabelogUrl, pickTabelogUrl } = require('./tabelog');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -26,6 +27,7 @@ const CACHE_TTL_MS = {
   placesDetails      : 30 * 24 * 60 * 60 * 1000,  // 30日（7日→30日に延長）
   placesAutocomplete : 24 * 60 * 60 * 1000,        // 24時間
   tabelogSearch      : 90 * 24 * 60 * 60 * 1000,  // 90日（食べログURLは変わりにくい）
+  tabelogNotFound    : 7  * 24 * 60 * 60 * 1000,  //  7日（見つからなかった店の再検索を抑える）
 };
 
 /** @type {Map<string, {data: any, expiresAt: number}>} */
@@ -128,6 +130,8 @@ function ytFetch(path) {
 //  SerpAPI ヘルパー
 // ─────────────────────────────────────────
 const SERP_API_BASE = 'https://serpapi.com/search.json';
+// SerpAPIが応答しない場合にリクエストがハングし続けないための上限
+const SERP_API_TIMEOUT_MS = 25000;
 
 function serpApiFetch(query) {
   return new Promise((resolve, reject) => {
@@ -136,14 +140,15 @@ function serpApiFetch(query) {
       api_key : apiKey,
       engine  : 'google',
       q       : query,
-      num     : '1',
+      num     : '10',
       hl      : 'ja',
       gl      : 'jp',
     }).toString();
     const url = `${SERP_API_BASE}?${qs}`;
-    https.get(url, (res) => {
+    https.get(url, { signal: AbortSignal.timeout(SERP_API_TIMEOUT_MS) }, (res) => {
       let raw = '';
       res.on('data', chunk => raw += chunk);
+      res.on('error', reject);
       res.on('end', () => {
         try {
           resolve({ status: res.statusCode, body: JSON.parse(raw) });
@@ -504,7 +509,8 @@ app.get('/tabelog/search', async (req, res) => {
   const cacheKey = `tabelog:${place_id || name}`;
   const cached = cacheGet(cacheKey);
   if (cached !== null) {
-    return res.set('X-Cache', 'HIT').json(cached);
+    // 過去に口コミページ等のURLが保存されていても、店舗トップURLに正規化して返す
+    return res.set('X-Cache', 'HIT').json({ url: normalizeTabelogUrl(cached.url) });
   }
 
   // "site:tabelog.com 店名 住所" で検索
@@ -518,22 +524,20 @@ app.get('/tabelog/search', async (req, res) => {
       return res.status(429).set('X-Cache', 'MISS').json({ error: 'quota_exceeded' });
     }
 
-    if (status !== 200 || body.error) {
+    // 検索結果ゼロはエラー文言付きの200で返るため、エラーではなく「見つからなかった」として扱う
+    const noResults = status === 200 && typeof body.error === 'string'
+      && /hasn't returned any results/i.test(body.error);
+    if (!noResults && (status !== 200 || body.error)) {
       return res.status(status).set('X-Cache', 'MISS').json({ url: null });
     }
 
-    const results = body.organic_results || [];
-    // tabelog.com/[都道府県]/A[エリア]/A[サブエリア]/[店舗ID]/ の形式のURLを優先
-    const tabelogUrl = results
-      .map(item => item.link)
-      .find(link => /tabelog\.com\/[a-z]+\/A\d+\/A\d+\/\d+\//.test(link)) || null;
+    const tabelogUrl = pickTabelogUrl(body.organic_results, name);
 
     const result = { url: tabelogUrl };
-    // URLが見つかった場合のみキャッシュしてファイルに永続化
-    if (tabelogUrl) {
-      cacheSet(cacheKey, result, CACHE_TTL_MS.tabelogSearch);
-      saveTabelogCacheToFile();
-    }
+    // 見つかった場合は90日、見つからなかった場合は7日キャッシュし、ファイルに永続化
+    const ttl = tabelogUrl ? CACHE_TTL_MS.tabelogSearch : CACHE_TTL_MS.tabelogNotFound;
+    cacheSet(cacheKey, result, ttl);
+    saveTabelogCacheToFile();
 
     return res.set('X-Cache', 'MISS').json(result);
   } catch (err) {
