@@ -4,9 +4,14 @@ const express    = require('express');
 const https      = require('https');
 const fs         = require('fs');
 const path       = require('path');
+const zlib       = require('zlib');
+const crypto     = require('crypto');
+const { promisify } = require('util');
 const swaggerUi  = require('swagger-ui-express');
 const YAML       = require('yamljs');
 const { normalizeTabelogUrl, pickTabelogUrl } = require('./tabelog');
+
+const gzipAsync = promisify(zlib.gzip);
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -16,6 +21,47 @@ app.use(express.json());
 // Swagger UI
 const swaggerDocument = YAML.load('./swagger.yaml');
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
+
+// ─────────────────────────────────────────
+//  共通ユーティリティ
+// ─────────────────────────────────────────
+
+/** 環境変数を0以上の数値として読む（未設定・不正ならデフォルト） */
+function envInt(name, def) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return def;
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? v : def;
+}
+
+function inc(obj, key) {
+  obj[key] = (obj[key] || 0) + 1;
+}
+
+function pick(obj, keys) {
+  const out = {};
+  for (const k of keys) {
+    if (obj[k] !== undefined) out[k] = obj[k];
+  }
+  return out;
+}
+
+/** 同じキーの処理が同時に走っている間は1回だけ実行し、結果を共有する（Google課金の重複防止） */
+const inflight = new Map();
+function dedupe(key, fn) {
+  const running = inflight.get(key);
+  if (running) return running;
+  const promise = Promise.resolve().then(fn).finally(() => inflight.delete(key));
+  inflight.set(key, promise);
+  return promise;
+}
+
+/** 一時ファイルに書いてからrenameする（読み込み側に書きかけを見せない） */
+async function writeFileAtomic(file, data) {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await fs.promises.writeFile(tmp, data);
+  await fs.promises.rename(tmp, file);
+}
 
 // ─────────────────────────────────────────
 //  インメモリキャッシュ
@@ -44,14 +90,137 @@ function cacheGet(key) {
 }
 
 function cacheSet(key, data, ttlMs) {
+  // 一度消してから入れ直し、Mapの挿入順を「最終更新が古い順」に保つ
+  cache.delete(key);
   cache.set(key, { data, expiresAt: Date.now() + ttlMs });
+}
+
+// メモリ使用量の上限（種類ごと）。超えたら最終更新が古いものから削除する
+const CACHE_LIMITS = [
+  { prefix: 'places:nearby:',       max: 3000  },
+  { prefix: 'places:details:',      max: 20000 },
+  { prefix: 'places:autocomplete:', max: 5000  },
+  { prefix: 'tabelog:',             max: 20000 },
+  { prefix: 'search:',              max: 3000  },
+  { prefix: 'videos:',              max: 5000  },
+];
+
+// Googleの next_page_token → 1ページ目のキャッシュキー（2ページ目をキャッシュするための対応表）
+const PAGE_TOKEN_TTL_MS = 15 * 60 * 1000;
+const pageTokens = new Map();
+
+function rememberPageToken(token, key) {
+  pageTokens.set(token, { key, expiresAt: Date.now() + PAGE_TOKEN_TTL_MS });
+}
+
+function cacheSweep() {
+  const now = Date.now();
+  const groups = new Map(CACHE_LIMITS.map(l => [l.prefix, []]));
+  for (const [key, entry] of cache) {
+    if (now > entry.expiresAt) {
+      cache.delete(key);
+      continue;
+    }
+    const limit = CACHE_LIMITS.find(l => key.startsWith(l.prefix));
+    if (limit) groups.get(limit.prefix).push(key);
+  }
+  for (const limit of CACHE_LIMITS) {
+    const keys = groups.get(limit.prefix);
+    for (let i = 0; i < keys.length - limit.max; i++) cache.delete(keys[i]);
+  }
+  for (const [token, info] of pageTokens) {
+    if (now > info.expiresAt) pageTokens.delete(token);
+  }
+  for (const [k, w] of ipWindows) {
+    if (now - w.start > 2 * 60 * 1000) ipWindows.delete(k);
+  }
+}
+setInterval(cacheSweep, 10 * 60 * 1000).unref();
+
+// ─────────────────────────────────────────
+//  Google課金ガード（1日の上限・IPごとの上限）
+//  ※ キャッシュにヒットした場合は数えない。Googleへ実際に問い合わせる回数だけを制限する。
+//  ※ 0を指定した制限は無効。環境変数で調整できる（Azureのアプリ設定）。
+// ─────────────────────────────────────────
+const DAILY_LIMIT = {
+  nearby      : envInt('LIMIT_NEARBY_PER_DAY',       800),
+  details     : envInt('LIMIT_DETAILS_PER_DAY',     2000),
+  autocomplete: envInt('LIMIT_AUTOCOMPLETE_PER_DAY', 4000),
+  photo       : envInt('LIMIT_PHOTO_PER_DAY',        4000),
+};
+const IP_LIMIT_PER_MIN = {
+  nearby      : envInt('LIMIT_NEARBY_PER_IP_MIN',       20),
+  details     : envInt('LIMIT_DETAILS_PER_IP_MIN',      30),
+  autocomplete: envInt('LIMIT_AUTOCOMPLETE_PER_IP_MIN', 60),
+  photo       : envInt('LIMIT_PHOTO_PER_IP_MIN',       120),
+};
+
+const stats = { startedAt: new Date().toISOString(), hit: {}, miss: {}, skip: {}, upstream: {}, blocked: {} };
+const daily = { date: '', counts: {} };
+const ipWindows = new Map();
+
+/** 日本時間の日付（YYYY-MM-DD） */
+function jstDate() {
+  return new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function clientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  let ip = (typeof xff === 'string' && xff.length)
+    ? xff.split(',')[0].trim()
+    : ((req.socket && req.socket.remoteAddress) || 'unknown');
+  // Azure は "IPv4:ポート" 形式で付与することがある
+  if (/^\d+\.\d+\.\d+\.\d+:\d+$/.test(ip)) ip = ip.split(':')[0];
+  return ip;
+}
+
+/** Googleへ問い合わせてよいか判定し、許可する場合は回数を加算する */
+function allowUpstream(kind, ip) {
+  const today = jstDate();
+  if (daily.date !== today) {
+    daily.date = today;
+    daily.counts = {};
+  }
+  const dailyMax = DAILY_LIMIT[kind];
+  if (dailyMax && (daily.counts[kind] || 0) >= dailyMax) {
+    inc(stats.blocked, `${kind}:daily`);
+    return { ok: false, reason: 'daily_limit' };
+  }
+  const ipMax = IP_LIMIT_PER_MIN[kind];
+  if (ipMax) {
+    const k = `${ip}|${kind}`;
+    const now = Date.now();
+    let w = ipWindows.get(k);
+    if (!w || now - w.start >= 60 * 1000) {
+      w = { start: now, count: 0 };
+      ipWindows.set(k, w);
+    }
+    if (w.count >= ipMax) {
+      inc(stats.blocked, `${kind}:ip`);
+      return { ok: false, reason: 'ip_limit' };
+    }
+    w.count++;
+  }
+  daily.counts[kind] = (daily.counts[kind] || 0) + 1;
+  inc(stats.upstream, kind);
+  console.log(`[upstream] ${kind} (today=${daily.counts[kind]})`);
+  return { ok: true };
+}
+
+function sendLimited(res, reason) {
+  return res
+    .set('Retry-After', reason === 'ip_limit' ? '60' : '3600')
+    .status(429)
+    .json({ error: 'rate_limited', reason });
 }
 
 // ─────────────────────────────────────────
 //  写真キャッシュ設定
 // ─────────────────────────────────────────
-const PHOTO_CACHE_DIR    = path.join(process.env.HOME || '/home', 'photo_cache');
+const HOME_DIR           = process.env.HOME || '/home';
+const PHOTO_CACHE_DIR    = path.join(HOME_DIR, 'photo_cache');
 const PHOTO_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90日
+const PHOTO_CACHE_CONTROL = 'public, max-age=2592000'; // 端末側でも30日キャッシュさせる
 
 try { fs.mkdirSync(PHOTO_CACHE_DIR, { recursive: true }); } catch (_) {}
 
@@ -161,6 +330,90 @@ function serpApiFetch(query) {
 }
 
 // ─────────────────────────────────────────
+//  キャッシュ永続化（/home に保存。Azure App Service の /home は再起動後も消えない）
+//  ・変更があったときだけ、一定時間おきにまとめて非同期で書き出す
+//  ・SIGTERM（停止・再起動）時は同期で書き出してから終了する
+//  ・details / tabelog は従来のファイル名・形式のまま（既存データをそのまま読み込める）
+// ─────────────────────────────────────────
+const PERSIST_TARGETS = [
+  { prefix: 'places:details:', file: path.join(HOME_DIR, 'details_cache.json'),   gzip: false, max: 20000, delayMs: envInt('PERSIST_DELAY_SMALL_MS', 15 * 1000) },
+  { prefix: 'tabelog:',        file: path.join(HOME_DIR, 'tabelog_cache.json'),    gzip: false, max: 20000, delayMs: envInt('PERSIST_DELAY_SMALL_MS', 15 * 1000) },
+  // 周辺検索は1件が大きいため gzip 圧縮し、書き出し間隔も長めにする
+  { prefix: 'places:nearby:',  file: path.join(HOME_DIR, 'nearby_cache.json.gz'),  gzip: true,  max: 3000,  delayMs: envInt('PERSIST_DELAY_NEARBY_MS', 3 * 60 * 1000) },
+];
+
+function loadPersistedCaches() {
+  const now = Date.now();
+  for (const t of PERSIST_TARGETS) {
+    try {
+      if (!fs.existsSync(t.file)) continue;
+      let buf = fs.readFileSync(t.file);
+      if (t.gzip) buf = zlib.gunzipSync(buf);
+      const entries = JSON.parse(buf.toString('utf8'));
+      let loaded = 0;
+      for (const [key, entry] of Object.entries(entries)) {
+        if (entry.expiresAt > now) {
+          cache.set(key, entry);
+          loaded++;
+        }
+      }
+      console.log(`cache restored: ${loaded} entries (${t.prefix}) from ${path.basename(t.file)}`);
+    } catch (e) {
+      console.error(`cache load error (${t.prefix}):`, e.message);
+    }
+  }
+}
+
+function snapshotFor(target) {
+  const entries = [];
+  for (const [key, val] of cache) {
+    if (key.startsWith(target.prefix)) entries.push([key, val]);
+  }
+  return JSON.stringify(Object.fromEntries(entries.slice(-target.max)));
+}
+
+const persistTimers = new Map();
+
+function schedulePersist(prefix) {
+  if (persistTimers.has(prefix)) return;
+  const target = PERSIST_TARGETS.find(t => t.prefix === prefix);
+  if (!target) return;
+  const timer = setTimeout(async () => {
+    persistTimers.delete(prefix);
+    try {
+      let buf = Buffer.from(snapshotFor(target), 'utf8');
+      if (target.gzip) buf = await gzipAsync(buf);
+      await writeFileAtomic(target.file, buf);
+    } catch (e) {
+      console.error(`cache save error (${prefix}):`, e.message);
+    }
+  }, target.delayMs);
+  timer.unref();
+  persistTimers.set(prefix, timer);
+}
+
+function flushPersistSync() {
+  for (const target of PERSIST_TARGETS) {
+    try {
+      let buf = Buffer.from(snapshotFor(target), 'utf8');
+      if (target.gzip) buf = zlib.gzipSync(buf);
+      fs.writeFileSync(target.file, buf);
+    } catch (e) {
+      console.error(`cache flush error (${target.prefix}):`, e.message);
+    }
+  }
+}
+
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    flushPersistSync();
+    process.exit(0);
+  });
+}
+
+loadPersistedCaches();
+
+// ─────────────────────────────────────────
 //  ルート
 // ─────────────────────────────────────────
 
@@ -258,67 +511,168 @@ app.get('/youtube/videos', async (req, res) => {
 //  Places API ルート
 // ─────────────────────────────────────────
 
-/**
- * 周辺ラーメン店検索（24時間キャッシュ）
- * GET /places/nearbysearch?location=35.7,139.7&radius=1500&keyword=ラーメン&language=ja
- */
-app.get('/places/nearbysearch', async (req, res) => {
-  const params = { ...req.query };
-  delete params.key;
+const EMPTY_NEARBY = { status: 'ZERO_RESULTS', results: [], html_attributions: [] };
+const EMPTY_AUTOCOMPLETE = { status: 'ZERO_RESULTS', predictions: [] };
 
-  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
-  if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
+// 日本国内の座標だけ検索する（世界中の座標を叩かれて課金されるのを防ぐ。ALLOW_OUTSIDE_JAPAN=1 で無効化）
+const ALLOW_OUTSIDE_JAPAN = process.env.ALLOW_OUTSIDE_JAPAN === '1';
 
-  let cacheKey = null;
-  if (!params.pagetoken && params.location) {
-    // lat/lng をタイル単位（約890m）でグループ化してキャッシュ
-    const [lat, lng] = params.location.split(',').map(Number);
-    const latTile = Math.floor(lat / 0.008);
-    const lngTile = Math.floor(lng / 0.008);
-    cacheKey = `places:nearby:${latTile}_${lngTile}:${params.radius || '1500'}`;
-  }
-  // pagetoken は使い捨てなのでキャッシュしない
+function parseLocation(value) {
+  if (typeof value !== 'string') return null;
+  const parts = value.split(',');
+  if (parts.length !== 2) return null;
+  const lat = Number(parts[0]);
+  const lng = Number(parts[1]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+  return { lat, lng };
+}
 
-  if (cacheKey) {
-    const cached = cacheGet(cacheKey);
-    if (cached) return res.set('X-Cache', 'HIT').json(cached);
-  }
+function isInJapan({ lat, lng }) {
+  return lat >= 20 && lat <= 46.5 && lng >= 122 && lng <= 154.5;
+}
 
-  const qs = new URLSearchParams(params).toString();
+// 検索半径を250m刻み（切り上げ）にそろえる。
+// アプリは画面サイズから半径を1m単位で算出するため、そのままだとキャッシュキーがほぼ一致しない。
+const NEARBY_RADIUS_STEP = 250;
+function bucketRadius(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 1500;
+  return Math.min(50000, Math.max(NEARBY_RADIUS_STEP, Math.ceil(n / NEARBY_RADIUS_STEP) * NEARBY_RADIUS_STEP));
+}
+
+// サーバーが発行する2ページ目用トークン（Googleのトークンは短時間で失効するため、キャッシュ済みの2ページ目を引くための印）
+const SRV_TOKEN_PREFIX = 'srv:';
+function encodeSrvToken(key) {
+  return SRV_TOKEN_PREFIX + Buffer.from(key, 'utf8').toString('base64url');
+}
+function decodeSrvToken(token) {
   try {
-    const { status, body } = await placesFetch(`/nearbysearch/json?${qs}`);
-    if (cacheKey && status === 200 && (body.status === 'OK' || body.status === 'ZERO_RESULTS')) {
-      cacheSet(cacheKey, body, CACHE_TTL_MS.placesNearby);
+    const key = Buffer.from(token.slice(SRV_TOKEN_PREFIX.length), 'base64url').toString('utf8');
+    return key.startsWith('places:nearby:') ? key : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** キャッシュ済みの1ページ目を返す。2ページ目がキャッシュ済みなら、それを引ける印を付ける */
+function withNextPageToken(cachedBody, cacheKey) {
+  const out = { ...cachedBody };
+  delete out.next_page_token;
+  if (cacheGet(`${cacheKey}:p2`) !== null) {
+    out.next_page_token = encodeSrvToken(cacheKey);
+  }
+  return out;
+}
+
+/** 2ページ目（pagetoken）の取得 */
+async function handleNearbyNextPage(req, res, token) {
+  // サーバー発行トークン: キャッシュ済みの2ページ目を返す（Googleは呼ばない）
+  if (token.startsWith(SRV_TOKEN_PREFIX)) {
+    const baseKey = decodeSrvToken(token);
+    const p2 = baseKey ? cacheGet(`${baseKey}:p2`) : null;
+    if (p2) {
+      inc(stats.hit, 'nearby:p2');
+      return res.set('X-Cache', 'HIT').json(p2);
     }
-    return res.status(status).set('X-Cache', cacheKey ? 'MISS' : 'SKIP').json(body);
+    return res.set('X-Cache', 'SKIP').json(EMPTY_NEARBY);
+  }
+
+  // Googleのトークン: 同じ1ページ目から取得済みの2ページ目があればそれを返す
+  const known = pageTokens.get(token);
+  const baseKey = known && Date.now() <= known.expiresAt ? known.key : null;
+  if (baseKey) {
+    const p2 = cacheGet(`${baseKey}:p2`);
+    if (p2) {
+      inc(stats.hit, 'nearby:p2');
+      return res.set('X-Cache', 'HIT').json(p2);
+    }
+  }
+
+  inc(stats.miss, 'nearby:p2');
+  const ip = clientIp(req);
+  try {
+    const result = await dedupe(`nearby:p2:${token}`, async () => {
+      const gate = allowUpstream('nearby', ip);
+      if (!gate.ok) return { blocked: gate.reason };
+      return placesFetch(`/nearbysearch/json?${new URLSearchParams({ pagetoken: token }).toString()}`);
+    });
+    if (result.blocked) return sendLimited(res, result.blocked);
+
+    const { status, body } = result;
+    if (baseKey && status === 200 && body.status === 'OK') {
+      const p2Body = { ...body };
+      delete p2Body.next_page_token; // 次回以降は使えないトークンなので保存しない
+      cacheSet(`${baseKey}:p2`, p2Body, CACHE_TTL_MS.placesNearby);
+      schedulePersist('places:nearby:');
+    }
+    return res.status(status).set('X-Cache', 'MISS').json(body);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-});
+}
 
 /**
- * 店舗詳細取得（7日キャッシュ）
- * GET /places/details?place_id=XXX&fields=place_id,name,...&language=ja
+ * 周辺ラーメン店検索（7日キャッシュ）
+ * GET /places/nearbysearch?location=35.7,139.7&radius=1500&keyword=ラーメン&language=ja
  */
-app.get('/places/details', async (req, res) => {
-  const params = { ...req.query };
-  delete params.key;
-
-  if (!params.place_id) return res.status(400).json({ error: 'place_id is required' });
-
+app.get('/places/nearbysearch', async (req, res) => {
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
 
-  const cacheKey = `places:details:${params.place_id}:${params.fields || 'all'}`;
-  const cached = cacheGet(cacheKey);
-  if (cached) return res.set('X-Cache', 'HIT').json(cached);
+  // 許可したパラメータだけをGoogleへ渡す（クライアントからのkey等は無視）
+  const params = pick(req.query, ['location', 'radius', 'keyword', 'language', 'type', 'pagetoken']);
 
+  // 2ページ目以降は使い捨てトークンで取得する
+  if (params.pagetoken) return handleNearbyNextPage(req, res, String(params.pagetoken));
+
+  // アプリ起動時のウォームアップ（radius=1）はGoogleを呼ばずに即返す
+  const rawRadius = Number(params.radius);
+  if (Number.isFinite(rawRadius) && rawRadius <= 1) {
+    inc(stats.skip, 'nearby:warmup');
+    return res.set('X-Cache', 'SKIP').json(EMPTY_NEARBY);
+  }
+
+  const loc = parseLocation(params.location);
+  if (!loc) return res.status(400).json({ error: 'location is required (lat,lng)' });
+  if (!ALLOW_OUTSIDE_JAPAN && !isInJapan(loc)) {
+    inc(stats.skip, 'nearby:outside_japan');
+    return res.set('X-Cache', 'SKIP').json(EMPTY_NEARBY);
+  }
+
+  // 半径を丸め、キャッシュと同じ条件でGoogleに問い合わせる
+  const radius = bucketRadius(params.radius);
+  params.radius = String(radius);
+
+  // lat/lng をタイル単位（約890m）でグループ化してキャッシュ
+  const latTile = Math.floor(loc.lat / 0.008);
+  const lngTile = Math.floor(loc.lng / 0.008);
+  const cacheKey = `places:nearby:${latTile}_${lngTile}:${radius}:${params.keyword || ''}:${params.language || ''}:${params.type || ''}`;
+
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    inc(stats.hit, 'nearby');
+    return res.set('X-Cache', 'HIT').json(withNextPageToken(cached, cacheKey));
+  }
+
+  inc(stats.miss, 'nearby');
+  const ip = clientIp(req);
   const qs = new URLSearchParams(params).toString();
   try {
-    const { status, body } = await placesFetch(`/details/json?${qs}`);
-    if (status === 200 && body.status === 'OK') {
-      cacheSet(cacheKey, body, CACHE_TTL_MS.placesDetails);
-      saveDetailsCacheToFile();
+    const result = await dedupe(cacheKey, async () => {
+      const gate = allowUpstream('nearby', ip);
+      if (!gate.ok) return { blocked: gate.reason };
+      return placesFetch(`/nearbysearch/json?${qs}`);
+    });
+    if (result.blocked) return sendLimited(res, result.blocked);
+
+    const { status, body } = result;
+    if (status === 200 && (body.status === 'OK' || body.status === 'ZERO_RESULTS')) {
+      const cachedBody = { ...body };
+      delete cachedBody.next_page_token; // トークンは短時間で失効するため保存しない
+      cacheSet(cacheKey, cachedBody, CACHE_TTL_MS.placesNearby);
+      if (body.next_page_token) rememberPageToken(body.next_page_token, cacheKey);
+      schedulePersist('places:nearby:');
     }
     return res.status(status).set('X-Cache', 'MISS').json(body);
   } catch (err) {
@@ -326,26 +680,103 @@ app.get('/places/details', async (req, res) => {
   }
 });
 
+// 店舗詳細は安価な基本項目（Basic Data）に統一する。
+// 基本項目はいくつ取っても課金は同じなので、1店舗1回の問い合わせ・1キャッシュに集約する。
+// それ以外のフィールド（rating / opening_hours など課金の高いもの）の要求は無視する。
+const STANDARD_DETAIL_FIELDS = 'place_id,name,formatted_address,photos,geometry';
+
+/**
+ * 店舗詳細取得（30日キャッシュ）
+ * GET /places/details?place_id=XXX&fields=place_id,name,...&language=ja
+ */
+app.get('/places/details', async (req, res) => {
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
+
+  const placeId = typeof req.query.place_id === 'string' ? req.query.place_id : '';
+  if (!placeId) return res.status(400).json({ error: 'place_id is required' });
+  if (!/^[A-Za-z0-9_-]{10,400}$/.test(placeId)) return res.status(400).json({ error: 'place_id is invalid' });
+
+  const language = typeof req.query.language === 'string' && /^[A-Za-z-]{2,10}$/.test(req.query.language)
+    ? req.query.language
+    : 'ja';
+
+  // 既存のキャッシュ（standardフィールド・日本語）とキーの形式を合わせて、永続化済みデータをそのまま使う
+  const cacheKey = language === 'ja'
+    ? `places:details:${placeId}:${STANDARD_DETAIL_FIELDS}`
+    : `places:details:${placeId}:${STANDARD_DETAIL_FIELDS}:${language}`;
+
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    inc(stats.hit, 'details');
+    return res.set('X-Cache', 'HIT').json(cached);
+  }
+
+  inc(stats.miss, 'details');
+  const ip = clientIp(req);
+  const qs = new URLSearchParams({ place_id: placeId, fields: STANDARD_DETAIL_FIELDS, language }).toString();
+  try {
+    const result = await dedupe(cacheKey, async () => {
+      const gate = allowUpstream('details', ip);
+      if (!gate.ok) return { blocked: gate.reason };
+      return placesFetch(`/details/json?${qs}`);
+    });
+    if (result.blocked) return sendLimited(res, result.blocked);
+
+    const { status, body } = result;
+    if (status === 200 && body.status === 'OK') {
+      cacheSet(cacheKey, body, CACHE_TTL_MS.placesDetails);
+      schedulePersist('places:details:');
+    }
+    return res.status(status).set('X-Cache', 'MISS').json(body);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// オートコンプリートは候補の取りこぼしを避けるため、短すぎる入力（アプリが付ける「ラーメン」を除いて2文字未満）はGoogleを呼ばない
+const AUTOCOMPLETE_MIN_CHARS = envInt('AUTOCOMPLETE_MIN_CHARS', 2);
+
 /**
  * 店舗名オートコンプリート（24時間キャッシュ）
  * GET /places/autocomplete?input=一蘭&language=ja
  */
 app.get('/places/autocomplete', async (req, res) => {
-  const params = { ...req.query };
-  delete params.key;
-
-  if (!params.input) return res.status(400).json({ error: 'input is required' });
-
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
 
-  const cacheKey = `places:autocomplete:${params.input}:${params.language || 'ja'}`;
-  const cached = cacheGet(cacheKey);
-  if (cached) return res.set('X-Cache', 'HIT').json(cached);
+  const params = pick(req.query, ['input', 'types', 'components', 'language', 'sessiontoken']);
 
+  if (typeof params.input !== 'string' || !params.input) return res.status(400).json({ error: 'input is required' });
+
+  const core = params.input.replace(/\s*ラーメン\s*$/u, '').trim();
+  if ([...core].length < AUTOCOMPLETE_MIN_CHARS) {
+    inc(stats.skip, 'autocomplete:short');
+    return res.set('X-Cache', 'SKIP').json(EMPTY_AUTOCOMPLETE);
+  }
+
+  // 全角/半角・大文字小文字・空白の違いは同じ入力として扱う
+  const normalized = params.input.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+  const cacheKey = `places:autocomplete:${normalized}:${params.language || 'ja'}:${params.types || ''}:${params.components || ''}`;
+
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    inc(stats.hit, 'autocomplete');
+    return res.set('X-Cache', 'HIT').json(cached);
+  }
+
+  inc(stats.miss, 'autocomplete');
+  const ip = clientIp(req);
   const qs = new URLSearchParams(params).toString();
   try {
-    const { status, body } = await placesFetch(`/autocomplete/json?${qs}`);
+    const result = await dedupe(cacheKey, async () => {
+      const gate = allowUpstream('autocomplete', ip);
+      if (!gate.ok) return { blocked: gate.reason };
+      return placesFetch(`/autocomplete/json?${qs}`);
+    });
+    if (result.blocked) return sendLimited(res, result.blocked);
+
+    const { status, body } = result;
     if (status === 200 && (body.status === 'OK' || body.status === 'ZERO_RESULTS')) {
       cacheSet(cacheKey, body, CACHE_TTL_MS.placesAutocomplete);
     }
@@ -355,6 +786,14 @@ app.get('/places/autocomplete', async (req, res) => {
   }
 });
 
+// 写真の幅は決まった段階にそろえる（幅違いのリクエストごとに課金されるのを防ぐ）
+const PHOTO_WIDTHS = [100, 200, 400, 800, 1600];
+function normalizePhotoWidth(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 400;
+  return PHOTO_WIDTHS.find(w => n <= w) || 1600;
+}
+
 /**
  * 店舗写真（ファイルキャッシュ付き・90日TTL）
  * GET /places/photo?photo_reference=XXX&maxwidth=400
@@ -363,124 +802,56 @@ app.get('/places/autocomplete', async (req, res) => {
  * キャッシュMISS: Google Places Photo APIから取得しファイル保存後に返す
  */
 app.get('/places/photo', async (req, res) => {
-  const { photo_reference, maxwidth } = req.query;
+  const photo_reference = typeof req.query.photo_reference === 'string' ? req.query.photo_reference : '';
   if (!photo_reference) return res.status(400).json({ error: 'photo_reference is required' });
+  if (photo_reference.length < 20 || photo_reference.length > 2000) {
+    return res.status(400).json({ error: 'photo_reference is invalid' });
+  }
 
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY is not configured on server' });
 
   // ファイル名: photo_reference の記号をアンダースコアに変換して安全なパスにする
-  const mw       = String(maxwidth || 400);
+  const mw       = String(normalizePhotoWidth(req.query.maxwidth));
   const safeRef  = photo_reference.replace(/[^a-zA-Z0-9_-]/g, '_');
   const cacheFile = path.join(PHOTO_CACHE_DIR, `${safeRef}_${mw}`);
 
   // キャッシュHIT確認（ファイルのmtimeで90日TTLを判定）
   try {
-    const stat = fs.statSync(cacheFile);
+    const stat = await fs.promises.stat(cacheFile);
     if (Date.now() - stat.mtimeMs < PHOTO_CACHE_TTL_MS) {
-      const data = fs.readFileSync(cacheFile);
-      return res.set('X-Cache', 'HIT').set('Content-Type', 'image/jpeg').send(data);
+      const data = await fs.promises.readFile(cacheFile);
+      inc(stats.hit, 'photo');
+      return res.set('X-Cache', 'HIT').set('Content-Type', 'image/jpeg').set('Cache-Control', PHOTO_CACHE_CONTROL).send(data);
     }
   } catch (_) { /* キャッシュなし */ }
 
-  // キャッシュMISS: Googleから取得（リダイレクト追跡）
+  inc(stats.miss, 'photo');
+  const ip = clientIp(req);
+
+  // キャッシュMISS: Googleから取得（リダイレクト追跡）。同じ写真を同時に何件要求されても取得は1回だけ
   const googleUrl = `${PLACES_BASE}/photo?photo_reference=${encodeURIComponent(photo_reference)}&maxwidth=${mw}&key=${apiKey}`;
   try {
-    const { statusCode, contentType, data } = await fetchWithRedirect(googleUrl);
+    const result = await dedupe(`photo:${cacheFile}`, async () => {
+      const gate = allowUpstream('photo', ip);
+      if (!gate.ok) return { blocked: gate.reason };
+      const fetched = await fetchWithRedirect(googleUrl);
+      if (fetched.statusCode === 200 && fetched.data.length > 0) {
+        try { await writeFileAtomic(cacheFile, fetched.data); } catch (_) { /* ディスク書き込み失敗は無視 */ }
+      }
+      return fetched;
+    });
+    if (result.blocked) return sendLimited(res, result.blocked);
+
+    const { statusCode, contentType, data } = result;
     if (statusCode === 200 && data.length > 0) {
-      try { fs.writeFileSync(cacheFile, data); } catch (_) { /* ディスク書き込み失敗は無視 */ }
-      return res.set('X-Cache', 'MISS').set('Content-Type', contentType).send(data);
+      return res.set('X-Cache', 'MISS').set('Content-Type', contentType).set('Cache-Control', PHOTO_CACHE_CONTROL).send(data);
     }
     return res.status(statusCode).send(data);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
-
-// ─────────────────────────────────────────
-//  Place Details キャッシュ永続化（/home に保存）
-// ─────────────────────────────────────────
-
-const DETAILS_CACHE_FILE = path.join(process.env.HOME || '/home', 'details_cache.json');
-
-function loadDetailsCacheFromFile() {
-  try {
-    if (!fs.existsSync(DETAILS_CACHE_FILE)) return;
-    const raw     = fs.readFileSync(DETAILS_CACHE_FILE, 'utf8');
-    const entries = JSON.parse(raw);
-    const now     = Date.now();
-    let loaded    = 0;
-    for (const [key, entry] of Object.entries(entries)) {
-      if (entry.expiresAt > now) {
-        cache.set(key, entry);
-        loaded++;
-      }
-    }
-    console.log(`details cache restored: ${loaded} entries from file`);
-  } catch (e) {
-    console.error('details cache load error:', e.message);
-  }
-}
-
-function saveDetailsCacheToFile() {
-  try {
-    const detailsEntries = {};
-    for (const [key, val] of cache.entries()) {
-      if (key.startsWith('places:details:')) {
-        detailsEntries[key] = val;
-      }
-    }
-    fs.writeFileSync(DETAILS_CACHE_FILE, JSON.stringify(detailsEntries), 'utf8');
-  } catch (e) {
-    console.error('details cache save error:', e.message);
-  }
-}
-
-loadDetailsCacheFromFile();
-
-// ─────────────────────────────────────────
-//  食べログキャッシュ永続化（/home に保存）
-// ─────────────────────────────────────────
-
-// Azure App Service の /home は再起動後も消えない永続ストレージ
-const TABELOG_CACHE_FILE = path.join(process.env.HOME || '/home', 'tabelog_cache.json');
-
-// 起動時にファイルからキャッシュを復元
-function loadTabelogCacheFromFile() {
-  try {
-    if (!fs.existsSync(TABELOG_CACHE_FILE)) return;
-    const raw = fs.readFileSync(TABELOG_CACHE_FILE, 'utf8');
-    const entries = JSON.parse(raw);
-    const now = Date.now();
-    let loaded = 0;
-    for (const [key, entry] of Object.entries(entries)) {
-      if (entry.expiresAt > now) {
-        cache.set(key, entry);
-        loaded++;
-      }
-    }
-    console.log(`tabelog cache restored: ${loaded} entries from file`);
-  } catch (e) {
-    console.error('tabelog cache load error:', e.message);
-  }
-}
-
-// 食べログキャッシュのみファイルに書き出す
-function saveTabelogCacheToFile() {
-  try {
-    const tabelogEntries = {};
-    for (const [key, val] of cache.entries()) {
-      if (key.startsWith('tabelog:')) {
-        tabelogEntries[key] = val;
-      }
-    }
-    fs.writeFileSync(TABELOG_CACHE_FILE, JSON.stringify(tabelogEntries), 'utf8');
-  } catch (e) {
-    console.error('tabelog cache save error:', e.message);
-  }
-}
-
-loadTabelogCacheFromFile();
 
 // ─────────────────────────────────────────
 //  食べログ検索ルート
@@ -537,7 +908,7 @@ app.get('/tabelog/search', async (req, res) => {
     // 見つかった場合は90日、見つからなかった場合は7日キャッシュし、ファイルに永続化
     const ttl = tabelogUrl ? CACHE_TTL_MS.tabelogSearch : CACHE_TTL_MS.tabelogNotFound;
     cacheSet(cacheKey, result, ttl);
-    saveTabelogCacheToFile();
+    schedulePersist('tabelog:');
 
     return res.set('X-Cache', 'MISS').json(result);
   } catch (err) {
@@ -545,8 +916,21 @@ app.get('/tabelog/search', async (req, res) => {
   }
 });
 
-// キャッシュ状況確認（管理用）
-app.get('/cache/stats', (_req, res) => {
+// キャッシュ・課金ガードの状況確認（管理用）
+// ADMIN_TOKEN を設定し、ヘッダー x-admin-token（または ?token=）で渡した場合のみキー一覧まで返す。
+// 未設定・不一致のときは件数のみ。
+function isAdmin(req) {
+  const expected = process.env.ADMIN_TOKEN;
+  if (!expected) return false;
+  const given = String(req.get('x-admin-token') || req.query.token || '');
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+app.get('/cache/stats', (req, res) => {
+  if (!isAdmin(req)) return res.json({ count: cache.size });
+
   const now = Date.now();
   const entries = [];
   for (const [key, val] of cache.entries()) {
@@ -555,7 +939,12 @@ app.get('/cache/stats', (_req, res) => {
       expiresIn: Math.round((val.expiresAt - now) / 1000) + 's',
     });
   }
-  res.json({ count: cache.size, entries });
+  res.json({
+    count: cache.size,
+    stats,
+    today: { date: daily.date, upstream: daily.counts, limits: DAILY_LIMIT },
+    entries,
+  });
 });
 
 // ─────────────────────────────────────────
