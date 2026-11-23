@@ -215,10 +215,71 @@ function sendLimited(res, reason) {
 }
 
 // ─────────────────────────────────────────
+//  保存先（キャッシュ・写真）
+//  優先順位: 環境変数 DATA_DIR → /home（書き込めるとき）→ $HOME
+//  ・Azure App Service(Linux)で再起動・デプロイ後も残るのは /home だけ。
+//    $HOME が別の場所を指していても、/home を明示的に使うようにする。
+//  ・起動のたびに印（boot_info.json）を読み書きして、保存先が再起動後も残っているかを確認できるようにする
+//    （起動ログ、ヘルスチェック `/` の storage、管理用 `/cache/stats` で確認）
+// ─────────────────────────────────────────
+function isWritableDir(dir) {
+  try {
+    fs.accessSync(dir, fs.constants.W_OK);
+    return fs.statSync(dir).isDirectory();
+  } catch (_) {
+    return false;
+  }
+}
+
+function resolveDataDir() {
+  if (process.env.DATA_DIR) return { dir: process.env.DATA_DIR, source: 'DATA_DIR' };
+  if (isWritableDir('/home')) return { dir: '/home', source: '/home' };
+  if (process.env.HOME) return { dir: process.env.HOME, source: 'HOME' };
+  return { dir: '/home', source: 'fallback' };
+}
+
+const { dir: DATA_DIR, source: DATA_DIR_SOURCE } = resolveDataDir();
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+
+const storage = {
+  dataDir: DATA_DIR,
+  source: DATA_DIR_SOURCE,
+  writable: false,
+  bootCount: 1,
+  restoredFromPreviousRun: false, // 前回起動時の印が残っていた＝保存先が再起動後も残っている
+  firstBootAt: new Date().toISOString(),
+  previousBootAt: null,
+};
+
+(function recordBoot() {
+  const file = path.join(DATA_DIR, 'boot_info.json');
+  try {
+    if (fs.existsSync(file)) {
+      const prev = JSON.parse(fs.readFileSync(file, 'utf8'));
+      storage.restoredFromPreviousRun = true;
+      storage.bootCount = (Number(prev.count) || 0) + 1;
+      storage.firstBootAt = prev.firstBootAt || storage.firstBootAt;
+      storage.previousBootAt = prev.lastBootAt || null;
+    }
+    fs.writeFileSync(file, JSON.stringify({
+      count: storage.bootCount,
+      firstBootAt: storage.firstBootAt,
+      lastBootAt: new Date().toISOString(),
+    }));
+    storage.writable = true;
+  } catch (e) {
+    storage.writable = false;
+    storage.error = e.message;
+  }
+  console.log(`[storage] dataDir=${DATA_DIR} (source=${DATA_DIR_SOURCE}) writable=${storage.writable} `
+    + `boot=#${storage.bootCount} restoredFromPreviousRun=${storage.restoredFromPreviousRun} previousBoot=${storage.previousBootAt}`
+    + (storage.error ? ` error=${storage.error}` : ''));
+})();
+
+// ─────────────────────────────────────────
 //  写真キャッシュ設定
 // ─────────────────────────────────────────
-const HOME_DIR           = process.env.HOME || '/home';
-const PHOTO_CACHE_DIR    = path.join(HOME_DIR, 'photo_cache');
+const PHOTO_CACHE_DIR    = path.join(DATA_DIR, 'photo_cache');
 const PHOTO_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000; // 90日
 const PHOTO_CACHE_CONTROL = 'public, max-age=2592000'; // 端末側でも30日キャッシュさせる
 
@@ -336,10 +397,10 @@ function serpApiFetch(query) {
 //  ・details / tabelog は従来のファイル名・形式のまま（既存データをそのまま読み込める）
 // ─────────────────────────────────────────
 const PERSIST_TARGETS = [
-  { prefix: 'places:details:', file: path.join(HOME_DIR, 'details_cache.json'),   gzip: false, max: 20000, delayMs: envInt('PERSIST_DELAY_SMALL_MS', 15 * 1000) },
-  { prefix: 'tabelog:',        file: path.join(HOME_DIR, 'tabelog_cache.json'),    gzip: false, max: 20000, delayMs: envInt('PERSIST_DELAY_SMALL_MS', 15 * 1000) },
+  { prefix: 'places:details:', file: path.join(DATA_DIR, 'details_cache.json'),   gzip: false, max: 20000, delayMs: envInt('PERSIST_DELAY_SMALL_MS', 15 * 1000) },
+  { prefix: 'tabelog:',        file: path.join(DATA_DIR, 'tabelog_cache.json'),    gzip: false, max: 20000, delayMs: envInt('PERSIST_DELAY_SMALL_MS', 15 * 1000) },
   // 周辺検索は1件が大きいため gzip 圧縮し、書き出し間隔も長めにする
-  { prefix: 'places:nearby:',  file: path.join(HOME_DIR, 'nearby_cache.json.gz'),  gzip: true,  max: 3000,  delayMs: envInt('PERSIST_DELAY_NEARBY_MS', 3 * 60 * 1000) },
+  { prefix: 'places:nearby:',  file: path.join(DATA_DIR, 'nearby_cache.json.gz'),  gzip: true,  max: 3000,  delayMs: envInt('PERSIST_DELAY_NEARBY_MS', 3 * 60 * 1000) },
 ];
 
 function loadPersistedCaches() {
@@ -423,6 +484,13 @@ app.get('/', (_req, res) => {
     status  : 'ok',
     message : 'ramen-api-server is running',
     cache   : `${cache.size} entries`,
+    // 保存先が再起動後も残っているかの確認用（パスは出さない）。
+    // 再起動して bootCount が増え、restoredFromPreviousRun が true なら保存先は残っている
+    storage : {
+      writable                : storage.writable,
+      bootCount               : storage.bootCount,
+      restoredFromPreviousRun : storage.restoredFromPreviousRun,
+    },
   });
 });
 
@@ -943,6 +1011,7 @@ app.get('/cache/stats', (req, res) => {
     count: cache.size,
     stats,
     today: { date: daily.date, upstream: daily.counts, limits: DAILY_LIMIT },
+    storage,
     entries,
   });
 });
